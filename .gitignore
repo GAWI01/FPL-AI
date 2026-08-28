@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.coverage.*
+.tox/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local model/data artifacts
+models/*.joblib
+models/*.pkl
+
+# Generated prediction outputs
+historical_data/current_data/*_predictions*.csv
+
+# Generated current-data CSVs
+historical_data/current_data/*_current.csv
+
+# Generated GW history
+historical_data/current_data/gw*_history.csv
