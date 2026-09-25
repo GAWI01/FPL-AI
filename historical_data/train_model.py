@@ -1,316 +1,317 @@
-import pandas as pd
-import numpy as np
+"""Train the FPL-AI V1.1 prediction model.
+
+Training is strictly time-ordered:
+- Train: 2020-21 through 2023-24
+- Test: 2024-25
+
+The persisted model input is defined exclusively by feature_contract.py.
+"""
+
+from __future__ import annotations
+
+import sys
 from pathlib import Path
 
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-import joblib
+from sklearn.preprocessing import OneHotEncoder
 
-from feature_contract import CATEGORICAL_COLUMNS, FEATURE_COLUMNS, NUMERIC_COLUMNS, build_feature_row
+# Allow the script to be executed directly from historical_data/ while
+# importing the canonical contract from the project root.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from feature_contract import (  # noqa: E402
+    CATEGORICAL_COLUMNS,
+    FEATURE_COLUMNS,
+    NUMERIC_COLUMNS,
+    build_feature_row,
+    validate_model_feature_names,
+)
 
 
-BASE_DIR = Path("historical_data")
+BASE_DIR = PROJECT_ROOT / "historical_data"
+MODEL_DIR = PROJECT_ROOT / "models"
+MODEL_OUTPUT = MODEL_DIR / "fpl_model_v1.pkl"
 
-TRAIN_SEASONS = [
+TRAIN_SEASONS = (
     "2020-21",
     "2021-22",
     "2022-23",
     "2023-24",
-]
+)
 
 TEST_SEASON = "2024-25"
-
 
 FEATURES = list(FEATURE_COLUMNS)
 
 
-def load_season(season):
-
+def load_season(season: str) -> pd.DataFrame:
+    """Load one generated historical feature dataset."""
     file = BASE_DIR / season / "features.csv"
+
+    if not file.exists():
+        raise FileNotFoundError(
+            f"Missing feature dataset for {season}: {file}"
+        )
 
     print(f"Leser {season}...")
 
     df = pd.read_csv(file)
 
+    required = {"player_id", "GW", "total_points"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"{season}/features.csv mangler kolonne(r): "
+            + ", ".join(sorted(missing))
+        )
+
     df["season"] = season
-
     return df
 
 
-def prepare_data(df):
+def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Build a leakage-safe same-fixture target and validate model inputs."""
+    result = df.sort_values(["player_id", "GW"]).copy()
 
-    # Sorter kronologisk per spiller
-    df = df.sort_values(
-        ["player_id", "GW"]
-    ).copy()
-
-    # Neste gameweek sine poeng
-    df["target"] = (
-        df.groupby("player_id")["total_points"]
-        .shift(-1)
+    # The generated historical feature row is the prediction snapshot for
+    # its own Gameweek: rolling player features are shifted to exclude the
+    # current GW, while fixture context (opponent/home-away) belongs to this
+    # GW. Therefore the correct target for row GW G is total_points at G.
+    #
+    # The previous implementation shifted this target to G+1, which paired
+    # GW G fixture context with GW G+1 outcomes and therefore did not match
+    # the production prediction semantics.
+    result["target"] = pd.to_numeric(
+        result["total_points"],
+        errors="coerce",
     )
 
-    # Fjern siste GW for hver spiller
-    df = df.dropna(
-        subset=["target"]
-    ).copy()
+    result = result.dropna(subset=["target"]).copy()
 
-    # Numeriske features
-    numeric_features = [
-        "price",
-        "was_home",
-        "points_last_3",
-        "points_last_5",
-        "points_avg_5",
-        "minutes_last_5",
-        "starts_last_5",
-        "goals_last_5",
-        "assists_last_5",
-        "bps_avg_5",
-        "influence_avg_5",
-        "creativity_avg_5",
-        "threat_avg_5",
-        "ict_index_avg_5",
-        "form_5",
-        "opponent_team",
-    ]
+    # Normalize the target and every canonical numeric feature.
+    result["target"] = pd.to_numeric(result["target"], errors="coerce")
 
-    # Konverter numeriske kolonner
-    for col in numeric_features:
-
-        df[col] = pd.to_numeric(
-            df[col],
-            errors="coerce"
+    for column in NUMERIC_COLUMNS:
+        result[column] = pd.to_numeric(
+            result[column],
+            errors="coerce",
         )
 
-    return df
-
-
-def main():
-
-    print("=" * 65)
-    print("FPL AI — ML TRAINING V1")
-    print("=" * 65)
-
-    print()
-    print("LASTER DATA")
-    print("-" * 65)
-
-    train_frames = []
-
-    for season in TRAIN_SEASONS:
-
-        df = load_season(season)
-
-        df = prepare_data(df)
-
-        train_frames.append(df)
-
-        print(
-            f"  {season}: {len(df)} rader"
-        )
-
-    train = pd.concat(
-        train_frames,
-        ignore_index=True
+    # The canonical builder converts missing numeric values to errors rather
+    # than silently inventing values, so historical feature rows are filled
+    # explicitly here. This matches the feature-engineering boundary.
+    result[list(NUMERIC_COLUMNS)] = (
+        result[list(NUMERIC_COLUMNS)]
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
     )
 
-    print()
-    print(
-        f"TRAIN TOTAL: {len(train)} rader"
-    )
+    result["position"] = result["position"].astype(str).str.strip()
 
-    # Test
-    test = load_season(TEST_SEASON)
+    invalid_positions = result["position"].eq("").any()
+    if invalid_positions:
+        raise ValueError("Historical data contains an empty position value.")
 
-    test = prepare_data(test)
+    result = result.dropna(subset=["target"]).copy()
 
-    print(
-        f"TEST TOTAL:  {len(test)} rader"
-    )
+    if result.empty:
+        raise ValueError("No trainable rows remain after target preparation.")
 
-    # ---------------------------------------------------------
-    # FEATURES
-    # ---------------------------------------------------------
+    # Validate the canonical contract against a real generated row.
+    build_feature_row(result.iloc[0].to_dict())
 
-    X_train = pd.DataFrame(
-        [build_feature_row(row) for _, row in train.iterrows()],
-        columns=FEATURES,
-    )
-    y_train = train["target"].copy()
+    return result
 
-    X_test = pd.DataFrame(
-        [build_feature_row(row) for _, row in test.iterrows()],
-        columns=FEATURES,
-    )
-    y_test = test["target"].copy()
 
-    categorical_features = list(CATEGORICAL_COLUMNS)
-    numeric_features = list(NUMERIC_COLUMNS)
-
-    # ---------------------------------------------------------
-    # PREPROCESSING
-    # ---------------------------------------------------------
-
+def build_model() -> Pipeline:
+    """Create the V1.1 preprocessing + Random Forest pipeline."""
     preprocessor = ColumnTransformer(
         transformers=[
             (
                 "categorical",
-                OneHotEncoder(
-                    handle_unknown="ignore"
-                ),
-                categorical_features
+                OneHotEncoder(handle_unknown="ignore"),
+                list(CATEGORICAL_COLUMNS),
             ),
             (
                 "numeric",
                 "passthrough",
-                numeric_features
-            )
+                list(NUMERIC_COLUMNS),
+            ),
         ]
     )
-
-    # ---------------------------------------------------------
-    # MODEL
-    # ---------------------------------------------------------
 
     model = RandomForestRegressor(
         n_estimators=300,
         max_depth=12,
         min_samples_leaf=10,
         random_state=42,
-        n_jobs=-1
+        n_jobs=-1,
     )
 
-    pipeline = Pipeline(
+    return Pipeline(
         steps=[
-            (
-                "preprocessor",
-                preprocessor
-            ),
-            (
-                "model",
-                model
-            )
+            ("preprocessor", preprocessor),
+            ("model", model),
         ]
     )
 
-    print()
-    print("TRENER RANDOM FOREST...")
-    print("-" * 65)
 
-    pipeline.fit(
-        X_train,
-        y_train
-    )
+def make_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert rows to the exact canonical model-input matrix."""
+    rows = [
+        build_feature_row(row)
+        for _, row in df.iterrows()
+    ]
 
-    print("✓ Modell trent")
+    matrix = pd.DataFrame(rows, columns=FEATURES)
 
-    # ---------------------------------------------------------
-    # EVALUATION
-    # ---------------------------------------------------------
-
-    predictions = pipeline.predict(
-        X_test
-    )
-
-    mae = mean_absolute_error(
-        y_test,
-        predictions
-    )
-
-    rmse = np.sqrt(
-        mean_squared_error(
-            y_test,
-            predictions
+    # Keep the matrix in exactly the same order as the persisted contract.
+    if tuple(matrix.columns) != FEATURE_COLUMNS:
+        raise ValueError(
+            "Generated feature matrix does not match FEATURE_COLUMNS."
         )
-    )
 
-    r2 = r2_score(
-        y_test,
-        predictions
-    )
+    return matrix
+
+
+def evaluate_model(
+    pipeline: Pipeline,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    test_rows: pd.DataFrame,
+) -> None:
+    """Print deterministic evaluation metrics and sample predictions."""
+    predictions = pipeline.predict(X_test)
+
+    mae = mean_absolute_error(y_test, predictions)
+    rmse = float(np.sqrt(mean_squared_error(y_test, predictions)))
+    r2 = r2_score(y_test, predictions)
 
     print()
-    print("=" * 65)
-    print("MODEL EVALUERING")
-    print("=" * 65)
+    print("=" * 70)
+    print("MODEL EVALUERING V1.1")
+    print("=" * 70)
+    print(f"MAE:  {mae:.3f}")
+    print(f"RMSE: {rmse:.3f}")
+    print(f"R²:   {r2:.3f}")
 
-    print(
-        f"MAE:  {mae:.3f}"
-    )
-
-    print(
-        f"RMSE: {rmse:.3f}"
-    )
-
-    print(
-        f"R²:   {r2:.3f}"
-    )
-
-    # ---------------------------------------------------------
-    # EKSEMPLER
-    # ---------------------------------------------------------
-
-    results = test[
-        [
-            "name",
-            "position",
-            "GW",
-            "total_points"
-        ]
+    results = test_rows[
+        ["name", "position", "GW", "total_points"]
     ].copy()
 
     results["predicted"] = predictions
-
-    results["error"] = (
-        results["predicted"]
-        - results["total_points"]
-    )
+    results["error"] = results["predicted"] - results["total_points"]
 
     results = results.sort_values(
-        "predicted",
-        ascending=False
+        ["predicted", "name"],
+        ascending=[False, True],
+        kind="mergesort",
     )
 
     print()
-    print("=" * 65)
+    print("=" * 70)
     print("TOP 20 PREDIKSJONER")
-    print("=" * 65)
+    print("=" * 70)
 
     for _, row in results.head(20).iterrows():
-
         print(
-            f"{row['name']:<30} "
+            f"{str(row['name']):<30} "
             f"GW {int(row['GW']):2d} "
-            f"Actual {row['total_points']:4.1f} "
-            f"Pred {row['predicted']:5.2f}"
+            f"Actual {float(row['total_points']):4.1f} "
+            f"Pred {float(row['predicted']):5.2f}"
         )
 
-    # ---------------------------------------------------------
-    # SAVE MODEL
-    # ---------------------------------------------------------
+    # Store metrics on the function object is deliberately avoided; the
+    # persisted artifact remains only the trained pipeline for compatibility.
+    return None
 
-    output = Path(
-        "models/fpl_model_v1.pkl"
+
+def main() -> None:
+    print("=" * 70)
+    print("FPL AI - ML TRAINING V1.1")
+    print("=" * 70)
+
+    print()
+    print("KANONISK FEATURE CONTRACT")
+    print("-" * 70)
+    print(f"Features: {len(FEATURES)}")
+    print(" | ".join(FEATURES))
+
+    print()
+    print("LASTER DATA")
+    print("-" * 70)
+
+    train_frames: list[pd.DataFrame] = []
+
+    for season in TRAIN_SEASONS:
+        frame = prepare_data(load_season(season))
+        train_frames.append(frame)
+        print(f"  {season}: {len(frame)} trainbare rader")
+
+    train = pd.concat(train_frames, ignore_index=True)
+
+    test = prepare_data(load_season(TEST_SEASON))
+
+    print()
+    print(f"TRAIN TOTAL: {len(train)} rader")
+    print(f"TEST TOTAL:  {len(test)} rader")
+
+    print()
+    print("BYGGER MODELLINPUT")
+    print("-" * 70)
+
+    X_train = make_feature_matrix(train)
+    y_train = train["target"].astype(float)
+
+    X_test = make_feature_matrix(test)
+    y_test = test["target"].astype(float)
+
+    print(f"X_train: {X_train.shape}")
+    print(f"X_test:  {X_test.shape}")
+
+    print()
+    print("TRENER RANDOM FOREST V1.1...")
+    print("-" * 70)
+
+    pipeline = build_model()
+    pipeline.fit(X_train, y_train)
+
+    # sklearn records feature_names_in_ on the pipeline from X_train.
+    validate_model_feature_names(
+        tuple(pipeline.feature_names_in_)
     )
 
-    joblib.dump(
+    print("OK: Modell trent")
+    print("OK: Feature contract verifisert")
+
+    evaluate_model(
         pipeline,
-        output
+        X_test,
+        y_test,
+        test,
     )
 
-    print()
-    print(
-        f"✓ Modell lagret: {output}"
-    )
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(pipeline, MODEL_OUTPUT)
 
     print()
-    print("=" * 65)
-    print("ML TRAINING FERDIG")
-    print("=" * 65)
+    print("=" * 70)
+    print("MODELL LAGRET")
+    print("=" * 70)
+    print(f"OK: {MODEL_OUTPUT}")
+    print("OK: Persisted input contract verified")
+    print()
+    print("=" * 70)
+    print("ML TRAINING V1.1 FERDIG")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

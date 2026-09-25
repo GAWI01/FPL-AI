@@ -1,0 +1,40 @@
+{
+  "model": "models\\fpl_model_v1_corrected.pkl",
+  "train_seasons": [
+    "2020-21",
+    "2021-22",
+    "2022-23",
+    "2023-24"
+  ],
+  "test_season": "2024-25",
+  "small": {
+    "start_gw": 1,
+    "end_gw": 6,
+    "metrics": {
+      "rows": 3925,
+      "mae": 0.6019955531828315,
+      "rmse": 1.2370478744448234,
+      "mean_actual": 1.2336305732484076,
+      "mean_predicted": 1.1650458260546042
+    }
+  },
+  "full": {
+    "start_gw": 1,
+    "end_gw": 38,
+    "metrics": {
+      "rows": 26615,
+      "mae": 0.7178699195090019,
+      "rmse": 1.582305349924325,
+      "mean_actual": 1.215104264512493,
+      "mean_predicted": 1.080407439611921
+    },
+    "xp_baseline_metrics": {
+      "rows": 26615,
+      "mae": 0.94179222243096,
+      "rmse": 1.9145872102387027,
+      "mean_actual": 1.215104264512493,
+      "mean_predicted": 1.1134022167950404
+    },
+    "model_beats_xp_baseline_mae": true
+  }
+}

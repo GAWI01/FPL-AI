@@ -1,242 +1,151 @@
-import os
+"""
+Generate current Gameweek predictions using the persisted FPL-AI model.
+
+The model input is always built through feature_contract.build_feature_row().
+Current players are filtered against the current FPL team universe before
+fixtures are matched or predictions are generated.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
 import sys
+from pathlib import Path
+
 import joblib
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# Add project root to Python import path.
-PROJECT_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from feature_contract import (
+    FEATURE_COLUMNS,
+    build_feature_row,
+    validate_model_feature_names,
 )
-
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-from feature_contract import build_feature_row, validate_model_feature_names
+from player_validation import filter_current_fpl_players
+from backend.data_manifest import publish_prediction_manifest, season_for_date
 
 
-# ================================================================
-# FPL AI — CURRENT GAMEWEEK PREDICTIONS V5
-# ================================================================
+CURRENT_DIR = Path(__file__).resolve().parent
+MODEL_PATH = PROJECT_ROOT / "models" / "fpl_model_v1.pkl"
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-MODEL_PATH = os.path.join(
-    PROJECT_ROOT,
-    "models",
-    "fpl_model_v1.pkl",
-)
-
-PLAYERS_PATH = os.path.join(CURRENT_DIR, "players_current.csv")
-TEAMS_PATH = os.path.join(CURRENT_DIR, "teams_current.csv")
-FIXTURES_PATH = os.path.join(CURRENT_DIR, "fixtures_current.csv")
-GAMEWEEKS_PATH = os.path.join(CURRENT_DIR, "gameweeks_current.csv")
+PLAYERS_PATH = CURRENT_DIR / "players_features_current.csv"
+TEAMS_PATH = CURRENT_DIR / "teams_current.csv"
+FIXTURES_PATH = CURRENT_DIR / "fixtures_current.csv"
+GAMEWEEKS_PATH = CURRENT_DIR / "gameweeks_current.csv"
 
 
-def header(text):
-    print("=" * 70)
-    print(text)
-    print("=" * 70)
-
-
-def num(value, default=0.0):
+def num(value, default: float = 0.0) -> float:
     value = pd.to_numeric(value, errors="coerce")
-
-    if pd.isna(value):
-        return default
-
-    return float(value)
+    return default if pd.isna(value) else float(value)
 
 
 def calculate_xp(
-    player,
-    form,
-    points_per_game,
-    minutes,
-    starts_last_5,
-    expected_goals,
-    expected_assists,
-):
-    """
-    Estimate expected points (xP) for the upcoming gameweek.
+    form: float,
+    points_per_game: float,
+    minutes: float,
+    expected_goals: float,
+    expected_assists: float,
+) -> float:
+    base = max(points_per_game, form, 0.0)
+    minutes_factor = np.clip(minutes / 90.0, 0.0, 1.0)
 
-    The persisted model explicitly expects xP, so this value is created
-    from currently available player signals before prediction.
-    """
-
-    # Base historical scoring signal.
-    base = max(
-        points_per_game,
-        form,
-        0.0,
-    )
-
-    # Minutes / expected-start adjustment.
-    minutes_factor = min(max(minutes / 90.0, 0.0), 1.0)
-
-    start_factor = min(max(starts_last_5, 0.0), 1.0)
-
-    # Attacking upside.
     attacking_bonus = (
         max(expected_goals, 0.0) * 4.0
         + max(expected_assists, 0.0) * 3.0
     )
 
-    # Conservative blend.
-    xp = (
-        base * 0.55
-        + attacking_bonus * 0.45
-    )
+    xp = base * 0.55 + attacking_bonus * 0.45
+    availability_factor = 0.35 + 0.65 * minutes_factor
 
-    # Do not allow a player with no recent minutes/starts to receive
-    # a full historical expectation.
-    availability_factor = (
-        0.35
-        + 0.40 * minutes_factor
-        + 0.25 * start_factor
-    )
-
-    xp *= availability_factor
-
-    # Keep the model input sane.
-    return max(0.0, min(float(xp), 15.0))
+    return float(np.clip(xp * availability_factor, 0.0, 15.0))
 
 
-def main():
-
-    header("FPL AI — CURRENT GAMEWEEK PREDICTIONS V5")
-
-    # ============================================================
-    # LOAD MODEL
-    # ============================================================
-
-    print("Laster ML-modell...")
+def main() -> None:
+    print("=" * 70)
+    print("FPL AI — CURRENT GAMEWEEK PREDICTIONS V1.2")
+    print("=" * 70)
 
     model = joblib.load(MODEL_PATH)
 
-    validate_model_feature_names(
-        list(model.feature_names_in_)
-    )
-
-    print("✓ Modell lastet")
-    print("✓ Modell feature contract: OK")
-
-    # ============================================================
-    # LOAD CURRENT DATA
-    # ============================================================
-
-    print("\nLeser 2026/27-data...")
+    model_features = list(model.feature_names_in_)
+    validate_model_feature_names(model_features)
 
     players = pd.read_csv(PLAYERS_PATH)
     teams = pd.read_csv(TEAMS_PATH)
     fixtures = pd.read_csv(FIXTURES_PATH)
     gameweeks = pd.read_csv(GAMEWEEKS_PATH)
 
-    print(f"Spillere:  {len(players)}")
-    print(f"Fixtures:  {len(fixtures)}")
+    # Hard eligibility gate: historical/obsolete players must not enter the
+    # live prediction universe merely because they exist in source data.
+    before_count = len(players)
+    players = filter_current_fpl_players(players, teams)
+    after_count = len(players)
 
-    # ============================================================
-    # TEAM LOOKUPS
-    # ============================================================
+    print(
+        f"Current FPL player validation: {after_count}/{before_count} players retained"
+    )
+
+    if players.empty:
+        raise RuntimeError("No current FPL players remain after validation.")
+
+    next_gw = gameweeks[gameweeks["is_next"].astype(bool)]
+
+    if next_gw.empty:
+        raise RuntimeError("No next Gameweek found.")
+
+    gw = int(next_gw.iloc[0]["id"])
+
+    gw_fixtures = fixtures[fixtures["event"] == gw].copy()
+
+    if gw_fixtures.empty:
+        raise RuntimeError(f"No fixtures found for GW{gw}.")
 
     team_id_to_name = dict(
-        zip(
-            teams["id"].astype(int),
-            teams["name"],
-        )
+        zip(teams["id"].astype(int), teams["name"])
     )
 
     team_name_to_id = {
-        name: int(team_id)
+        name: team_id
         for team_id, name in team_id_to_name.items()
     }
 
     team_data = {}
 
     for _, team in teams.iterrows():
-
         team_id = int(team["id"])
 
         team_data[team_id] = {
-            "name": team["name"],
-            "form": num(team.get("form", 0)),
             "strength": num(team.get("strength", 0)),
-
             "strength_overall_home": num(
                 team.get("strength_overall_home", 0)
             ),
-
             "strength_overall_away": num(
                 team.get("strength_overall_away", 0)
             ),
-
             "strength_attack_home": num(
                 team.get("strength_attack_home", 0)
             ),
-
             "strength_attack_away": num(
                 team.get("strength_attack_away", 0)
             ),
-
             "strength_defence_home": num(
                 team.get("strength_defence_home", 0)
             ),
-
             "strength_defence_away": num(
                 team.get("strength_defence_away", 0)
             ),
         }
 
-    # ============================================================
-    # FIND NEXT GAMEWEEK
-    # ============================================================
-
-    next_gw = gameweeks[
-        gameweeks["is_next"] == True
-    ]
-
-    if next_gw.empty:
-
-        print("\n✗ Fant ingen neste gameweek.")
-        return
-
-    gw = int(next_gw.iloc[0]["id"])
-
-    print(f"\nNeste gameweek: GW{gw}")
-
-    # ============================================================
-    # GW FIXTURES
-    # ============================================================
-
-    gw_fixtures = fixtures[
-        fixtures["event"] == gw
-    ].copy()
-
-    print(f"Fixtures i GW{gw}: {len(gw_fixtures)}")
-
-    if gw_fixtures.empty:
-
-        print("\n✗ Ingen fixtures funnet.")
-        return
-
-    # ============================================================
-    # BUILD FIXTURE LOOKUP
-    # ============================================================
-
-    fixture_lookup = {}
+    fixture_lookup: dict[int, dict] = {}
 
     for _, fixture in gw_fixtures.iterrows():
-
         home_id = int(fixture["team_h"])
         away_id = int(fixture["team_a"])
-
-        difficulty_home = num(
-            fixture.get("team_h_difficulty", 0)
-        )
-
-        difficulty_away = num(
-            fixture.get("team_a_difficulty", 0)
-        )
 
         fixture_lookup[home_id] = {
             "opponent_id": away_id,
@@ -245,8 +154,7 @@ def main():
                 f"Team {away_id}",
             ),
             "was_home": True,
-            "difficulty": difficulty_home,
-            "fixture_id": int(fixture["id"]),
+            "difficulty": num(fixture.get("team_h_difficulty", 0)),
         }
 
         fixture_lookup[away_id] = {
@@ -256,44 +164,13 @@ def main():
                 f"Team {home_id}",
             ),
             "was_home": False,
-            "difficulty": difficulty_away,
-            "fixture_id": int(fixture["id"]),
+            "difficulty": num(fixture.get("team_a_difficulty", 0)),
         }
-
-    # ============================================================
-    # SHOW FIXTURES
-    # ============================================================
-
-    print("\nGW FIXTURES")
-    print("-" * 70)
-
-    for _, fixture in gw_fixtures.iterrows():
-
-        home = team_id_to_name.get(
-            int(fixture["team_h"]),
-            "Unknown",
-        )
-
-        away = team_id_to_name.get(
-            int(fixture["team_a"]),
-            "Unknown",
-        )
-
-        print(
-            f"{home:<22} vs {away:<22}"
-        )
-
-    # ============================================================
-    # BUILD PLAYER ROWS
-    # ============================================================
 
     rows = []
 
     for _, player in players.iterrows():
-
-        player_id = int(player["player_id"])
-        player_name = player["name"]
-        team_name = player["team"]
+        team_name = str(player.get("team", ""))
 
         if team_name not in team_name_to_id:
             continue
@@ -304,557 +181,249 @@ def main():
             continue
 
         fixture = fixture_lookup[team_id]
-
         opponent_id = fixture["opponent_id"]
 
-        own_team = team_data.get(
-            team_id,
-            {},
-        )
+        own = team_data.get(team_id, {})
+        opponent = team_data.get(opponent_id, {})
 
-        opponent_team = team_data.get(
-            opponent_id,
-            {},
-        )
+        was_home = fixture["was_home"]
 
-        # ========================================================
-        # PLAYER CURRENT DATA
-        # ========================================================
+        if was_home:
+            own_attack = own.get(
+                "strength_attack_home",
+                own.get("strength", 0),
+            )
+            own_defence = own.get(
+                "strength_defence_home",
+                own.get("strength", 0),
+            )
+            own_overall = own.get(
+                "strength_overall_home",
+                own.get("strength", 0),
+            )
 
-        price = num(player.get("price", 0))
+            opponent_attack = opponent.get(
+                "strength_attack_away",
+                opponent.get("strength", 0),
+            )
+            opponent_defence = opponent.get(
+                "strength_defence_away",
+                opponent.get("strength", 0),
+            )
+            opponent_overall = opponent.get(
+                "strength_overall_away",
+                opponent.get("strength", 0),
+            )
+        else:
+            own_attack = own.get(
+                "strength_attack_away",
+                own.get("strength", 0),
+            )
+            own_defence = own.get(
+                "strength_defence_away",
+                own.get("strength", 0),
+            )
+            own_overall = own.get(
+                "strength_overall_away",
+                own.get("strength", 0),
+            )
+
+            opponent_attack = opponent.get(
+                "strength_attack_home",
+                opponent.get("strength", 0),
+            )
+            opponent_defence = opponent.get(
+                "strength_defence_home",
+                opponent.get("strength", 0),
+            )
+            opponent_overall = opponent.get(
+                "strength_overall_home",
+                opponent.get("strength", 0),
+            )
+
         form = num(player.get("form", 0))
+        ppg = num(player.get("points_per_game", 0))
+        minutes = num(player.get("minutes", 0))
 
-        points_per_game = num(
-            player.get("points_per_game", 0)
+        expected_goals = num(player.get("expected_goals", 0))
+        expected_assists = num(player.get("expected_assists", 0))
+
+        xmins = num(player.get("xmins", minutes))
+        start_probability = num(
+            player.get(
+                "start_probability",
+                np.clip(xmins / 90.0, 0.0, 1.0),
+            )
         )
 
-        minutes = num(
-            player.get("minutes", 0)
-        )
-
-        goals = num(
-            player.get("goals_scored", 0)
-        )
-
-        assists = num(
-            player.get("assists", 0)
-        )
-
-        bps = num(
-            player.get("bps", 0)
-        )
-
-        influence = num(
-            player.get("influence", 0)
-        )
-
-        creativity = num(
-            player.get("creativity", 0)
-        )
-
-        threat = num(
-            player.get("threat", 0)
-        )
-
-        ict_index = num(
-            player.get("ict_index", 0)
-        )
-
-        expected_goals = num(
-            player.get("expected_goals", 0)
-        )
-
-        expected_assists = num(
-            player.get("expected_assists", 0)
-        )
-
-        # ========================================================
-        # ROLLING FEATURES
-        # ========================================================
-
-        minutes_last_5 = minutes
-
-        starts_last_5 = min(
-            minutes / 90.0,
-            1.0,
-        )
-
-        points_last_3 = points_per_game
-        points_last_5 = points_per_game
-        points_avg_5 = points_per_game
-
-        goals_last_5 = goals
-        assists_last_5 = assists
-
-        bps_avg_5 = bps
-        influence_avg_5 = influence
-        creativity_avg_5 = creativity
-        threat_avg_5 = threat
-        ict_index_avg_5 = ict_index
-
-        form_5 = form
-
-        # ========================================================
-        # EXPECTED POINTS
-        # ========================================================
-
-        xP = calculate_xp(
-            player=player,
+        xp = calculate_xp(
             form=form,
-            points_per_game=points_per_game,
-            minutes=minutes,
-            starts_last_5=starts_last_5,
+            points_per_game=ppg,
+            minutes=xmins,
             expected_goals=expected_goals,
             expected_assists=expected_assists,
         )
 
-        # ========================================================
-        # AVAILABILITY
-        # ========================================================
-
-        chance_playing = num(
-            player.get(
-                "chance_of_playing_next_round",
-                100,
-            ),
-            100,
-        )
-
-        status = str(
-            player.get("status", "a")
-        ).strip().lower()
-
-        availability_multiplier = (
-            max(
-                0,
-                min(chance_playing, 100),
-            )
-            / 100.0
-        )
-
-        if status in ["i", "s", "u"]:
-            availability_multiplier *= 0.5
-
-        # ========================================================
-        # TEAM STRENGTH
-        # ========================================================
-
-        if fixture["was_home"]:
-
-            own_attack = own_team.get(
-                "strength_attack_home",
-                own_team.get("strength", 0),
-            )
-
-            own_defence = own_team.get(
-                "strength_defence_home",
-                own_team.get("strength", 0),
-            )
-
-            own_overall = own_team.get(
-                "strength_overall_home",
-                own_team.get("strength", 0),
-            )
-
-            opponent_attack = opponent_team.get(
-                "strength_attack_away",
-                opponent_team.get("strength", 0),
-            )
-
-            opponent_defence = opponent_team.get(
-                "strength_defence_away",
-                opponent_team.get("strength", 0),
-            )
-
-            opponent_overall = opponent_team.get(
-                "strength_overall_away",
-                opponent_team.get("strength", 0),
-            )
-
-        else:
-
-            own_attack = own_team.get(
-                "strength_attack_away",
-                own_team.get("strength", 0),
-            )
-
-            own_defence = own_team.get(
-                "strength_defence_away",
-                own_team.get("strength", 0),
-            )
-
-            own_overall = own_team.get(
-                "strength_overall_away",
-                own_team.get("strength", 0),
-            )
-
-            opponent_attack = opponent_team.get(
-                "strength_attack_home",
-                opponent_team.get("strength", 0),
-            )
-
-            opponent_defence = opponent_team.get(
-                "strength_defence_home",
-                opponent_team.get("strength", 0),
-            )
-
-            opponent_overall = opponent_team.get(
-                "strength_overall_home",
-                opponent_team.get("strength", 0),
-            )
-
-        # ========================================================
-        # FIXTURE SCORE
-        # ========================================================
-
-        attack_advantage = (
-            own_attack - opponent_defence
-        )
-
-        defence_advantage = (
-            own_defence - opponent_attack
-        )
-
-        overall_advantage = (
-            own_overall - opponent_overall
-        )
-
-        difficulty = fixture["difficulty"]
-
-        difficulty_factor = (
-            1.0
-            - ((difficulty - 1.0) / 10.0)
-        )
-
-        difficulty_factor = max(
-            0.70,
-            min(difficulty_factor, 1.10),
-        )
-
-        # ========================================================
-        # MODEL INPUT
-        # ========================================================
-
         model_row = build_feature_row({
-
-            "xP": xP,
-
-            "price": price,
-            "was_home": fixture["was_home"],
-
-            "points_last_3": points_last_3,
-            "points_last_5": points_last_5,
-            "points_avg_5": points_avg_5,
-
-            "minutes_last_5": minutes_last_5,
-            "starts_last_5": starts_last_5,
-
-            "goals_last_5": goals_last_5,
-            "assists_last_5": assists_last_5,
-
-            "bps_avg_5": bps_avg_5,
-            "influence_avg_5": influence_avg_5,
-            "creativity_avg_5": creativity_avg_5,
-            "threat_avg_5": threat_avg_5,
-            "ict_index_avg_5": ict_index_avg_5,
-
-            "form_5": form_5,
-
-            "position": player["position"],
+            "xP": xp,
+            "price": num(player.get("price", 0)),
+            "was_home": was_home,
+            "points_last_3": num(player.get("points_last_3", 0)),
+            "points_last_5": num(player.get("points_last_5", 0)),
+            "points_avg_5": num(player.get("points_avg_5", 0)),
+            "minutes_last_5": num(player.get("minutes_last_5", 0)),
+            "starts_last_5": num(
+                player.get("starts_last_5", start_probability)
+            ),
+            "goals_last_5": num(player.get("goals_last_5", 0)),
+            "assists_last_5": num(player.get("assists_last_5", 0)),
+            "bps_avg_5": num(player.get("bps_avg_5", 0)),
+            "influence_avg_5": num(player.get("influence_avg_5", 0)),
+            "creativity_avg_5": num(player.get("creativity_avg_5", 0)),
+            "threat_avg_5": num(player.get("threat_avg_5", 0)),
+            "ict_index_avg_5": num(player.get("ict_index_avg_5", 0)),
+            "form_5": num(player.get("form_5", 0)),
+            "position": str(player.get("position", "")).upper().replace(
+                "GKP",
+                "GK",
+            ),
             "opponent_team": opponent_id,
         })
 
         rows.append({
-
-            "player_id": player_id,
-            "name": player_name,
+            "player_id": int(player["player_id"]),
+            "name": player["name"],
             "position": player["position"],
             "team": team_name,
-            "price": price,
-
+            "price": num(player.get("price", 0)),
             "opponent": fixture["opponent_name"],
-            "was_home": fixture["was_home"],
-            "difficulty": difficulty,
-
+            "home": was_home,
+            "difficulty": fixture["difficulty"],
             "form": form,
             "minutes": minutes,
-
-            "xP": xP,
-
-            "availability": availability_multiplier,
-
-            "attack_advantage": attack_advantage,
-            "defence_advantage": defence_advantage,
-            "overall_advantage": overall_advantage,
-
-            "difficulty_factor": difficulty_factor,
-
+            "xP": xp,
+            "xmins": xmins,
+            "start_probability": start_probability,
             "model": model_row,
         })
 
-    # ============================================================
-    # CHECK
-    # ============================================================
-
-    print(
-        f"\nSpillere matchet mot GW{gw}: {len(rows)}"
-    )
-
     if not rows:
+        raise RuntimeError("No players matched the current Gameweek fixtures.")
 
-        print(
-            "\n✗ Ingen spillere kunne matches mot fixtures."
-        )
-
-        return
-
-    # ============================================================
-    # MODEL INPUT
-    # ============================================================
-
-    model_rows = [
-        row["model"]
-        for row in rows
-    ]
-
-    X = pd.DataFrame(model_rows)
-
-    expected_features = list(
-        model.feature_names_in_
+    X = pd.DataFrame(
+        [row["model"] for row in rows],
+        columns=FEATURE_COLUMNS,
     )
 
-    X = X[expected_features]
-
-    # ============================================================
-    # VERIFY MODEL INPUT
-    # ============================================================
-
-    print("\nMODEL INPUT")
-    print("-" * 70)
-    print(f"Features: {len(expected_features)}")
-    print("✓ xP inkludert")
-    print("✓ Feature order matches persisted model")
-
-    # ============================================================
-    # ML PREDICTION
-    # ============================================================
-
-    print("\nKjører ML-prediksjon...")
-    print("-" * 70)
-
-    ml_predictions = model.predict(X)
-
-    # ============================================================
-    # FINAL CONTEXT ADJUSTMENT
-    # ============================================================
+    predictions = model.predict(X)
 
     results = []
 
-    for row, ml_prediction in zip(
-        rows,
-        ml_predictions,
-    ):
+    for row, ml_prediction in zip(rows, predictions):
+        prediction = max(0.0, float(ml_prediction))
 
-        prediction = float(
-            max(0, ml_prediction)
+        attack_advantage = 0.015 * (
+            num(
+                team_data.get(
+                    team_name_to_id[row["team"]],
+                    {},
+                ).get(
+                    "strength_attack_home"
+                    if row["home"]
+                    else "strength_attack_away",
+                    0,
+                )
+            )
+            - num(
+                team_data.get(
+                    fixture_lookup[
+                        team_name_to_id[row["team"]]
+                    ]["opponent_id"],
+                    {},
+                ).get(
+                    "strength_defence_away"
+                    if row["home"]
+                    else "strength_defence_home",
+                    0,
+                )
+            )
         )
 
-        # Fixture adjustment
-
-        fixture_adjustment = (
-            1.0
-            + row["attack_advantage"] * 0.015
-            + row["overall_advantage"] * 0.008
+        difficulty_factor = np.clip(
+            1.0 - ((row["difficulty"] - 1.0) / 10.0),
+            0.70,
+            1.10,
         )
 
-        fixture_adjustment *= (
-            row["difficulty_factor"]
-        )
-
-        fixture_adjustment = max(
+        prediction *= np.clip(
+            (1.0 + attack_advantage) * difficulty_factor,
             0.75,
-            min(fixture_adjustment, 1.25),
+            1.25,
         )
 
-        prediction *= fixture_adjustment
-
-        # Availability
-
-        prediction *= (
-            0.75
-            + 0.25 * row["availability"]
-        )
-
-        # Form
-
-        form_bonus = min(
-            max(row["form"], 0),
-            10,
-        ) * 0.025
-
-        prediction *= (
-            1.0 + form_bonus
-        )
-
-        # Prediction limits
-
-        prediction = max(
+        availability = np.clip(
+            row["start_probability"],
             0.0,
-            min(prediction, 15.0),
+            1.0,
         )
 
-        # Value
+        prediction *= 0.75 + 0.25 * availability
 
         value = (
             prediction / row["price"]
             if row["price"] > 0
-            else 0
+            else 0.0
         )
 
         results.append({
-
             "player_id": row["player_id"],
             "name": row["name"],
             "position": row["position"],
             "team": row["team"],
             "price": row["price"],
-
             "opponent": row["opponent"],
-            "home": row["was_home"],
+            "home": row["home"],
             "difficulty": row["difficulty"],
-
             "form": row["form"],
             "minutes": row["minutes"],
-
-            "xP": round(
-                row["xP"],
+            "xP": round(row["xP"], 3),
+            "xmins": round(row["xmins"], 1),
+            "start_probability": round(
+                row["start_probability"],
                 3,
             ),
-
-            "availability": round(
-                row["availability"] * 100,
-                1,
-            ),
-
             "ml_prediction": round(
                 float(ml_prediction),
                 3,
             ),
-
             "predicted_points": round(
-                prediction,
+                float(np.clip(prediction, 0.0, 15.0)),
                 3,
             ),
-
-            "value": round(
-                value,
-                3,
-            ),
+            "value": round(value, 3),
         })
 
-    result_df = pd.DataFrame(results)
-
-    result_df = result_df.sort_values(
+    result_df = pd.DataFrame(results).sort_values(
         "predicted_points",
         ascending=False,
     )
 
-    # ============================================================
-    # SAVE
-    # ============================================================
-
-    output_path = os.path.join(
-        CURRENT_DIR,
-        f"gw{gw}_predictions_v5.csv",
-    )
-
-    result_df.to_csv(
+    output_path = CURRENT_DIR / f"gw{gw}_predictions_v11.csv"
+    result_df.to_csv(output_path, index=False)
+    manifest_path = publish_prediction_manifest(
         output_path,
-        index=False,
+        season=season_for_date(datetime.now(timezone.utc)),
+        prediction_event=gw,
+        player_count=len(result_df),
     )
 
-    # ============================================================
-    # TOP 30
-    # ============================================================
+    print(f"\nGW{gw}")
+    print(f"Players predicted: {len(result_df)}")
+    print(f"Saved: {output_path}")
+    print(f"Manifest: {manifest_path}")
 
-    print("\nTOP 30 GW-PREDIKSJONER V5")
-    print("-" * 70)
-
-    for i, (_, row) in enumerate(
-        result_df.head(30).iterrows(),
-        start=1,
-    ):
-
-        home_away = (
-            "H"
-            if row["home"]
-            else "A"
-        )
-
-        print(
-            f"{i:2}. "
-            f"{row['name']:<24} "
-            f"{row['position']:<3} "
-            f"{row['team']:<18} "
-            f"vs {row['opponent']:<18} "
-            f"{home_away}  "
-            f"£{row['price']:.1f}m  "
-            f"xP {row['xP']:.2f}  "
-            f"→ {row['predicted_points']:.2f}"
-        )
-
-    # ============================================================
-    # TOP VALUE
-    # ============================================================
-
-    print("\nTOP 15 VALUE")
-    print("-" * 70)
-
-    value_df = result_df[
-        result_df["price"] <= 7.0
-    ].sort_values(
-        "value",
-        ascending=False,
-    )
-
-    for i, (_, row) in enumerate(
-        value_df.head(15).iterrows(),
-        start=1,
-    ):
-
-        print(
-            f"{i:2}. "
-            f"{row['name']:<24} "
-            f"{row['position']:<3} "
-            f"£{row['price']:.1f}m  "
-            f"xP {row['xP']:.2f}  "
-            f"→ {row['predicted_points']:.2f} "
-            f"({row['value']:.2f} pts/£m)"
-        )
-
-    # ============================================================
-    # SUMMARY
-    # ============================================================
-
-    print("\n" + "=" * 70)
-    print("V5 PREDIKSJON FERDIG")
-    print("=" * 70)
-
-    print(
-        f"\n✓ {len(result_df)} spillere predikert"
-    )
-
-    print(
-        f"✓ GW{gw}"
-    )
-
-    print(
-        f"✓ xP inkludert i modellinput"
-    )
-
-    print(
-        f"✓ Lagret: {output_path}"
-    )
+    print("\nTOP 30")
+    print(result_df.head(30).to_string(index=False))
 
 
 if __name__ == "__main__":

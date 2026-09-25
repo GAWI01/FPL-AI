@@ -1,9 +1,115 @@
 # FPL-AI
 
-Experimental Fantasy Premier League (FPL) decision-support system combining data, prediction models, optimization and an AI reasoning layer.
+Premium Fantasy Premier League (FPL) decision-support system combining live official data, prediction models, optimization and an explainable decision layer.
 
-> **Status:** Active development / research prototype  
-> **Current strategic direction:** Replace the V1–V5 brute-force optimizer with a fast constraint-based optimizer and build a reliable weekly decision pipeline.
+The repository now also contains a responsive premium web cockpit in `frontend/` and a resilient versioned API in `backend/`. See [docs/PREMIUM_DASHBOARD.md](docs/PREMIUM_DASHBOARD.md) for product surfaces, setup, deployment configuration and verification.
+
+> **Status:** Private/local premium MVP. The engineering PRD is implemented and locally verified; public/paid release remains gated by data-use permissions and hosted/device QA.
+> **Current product:** Responsive Next.js cockpit plus FastAPI decision API, public Team ID connection, live mode, interactive squad, five-GW Plan/What-if, player/fixture Explore and post-GW review.
+
+Start with [the premium dashboard guide](docs/PREMIUM_DASHBOARD.md), inspect [the PRD status](docs/PRD_IMPLEMENTATION_STATUS.md), and do not publish commercially before clearing [the data-use release gate](docs/DATA_USE_RELEASE_GATE.md).
+
+## Run FPL AI locally
+
+FPL AI consists of two processes:
+
+- a FastAPI backend on `http://localhost:8000`
+- a Next.js frontend on `http://localhost:3000`
+
+The application reads public Fantasy Premier League data at runtime. You do not
+need an FPL password or API key. To connect a team, use the numeric Team ID from
+the official FPL URL, for example `https://fantasy.premierleague.com/entry/1234567/event/1`.
+
+### Option A: Docker Compose (recommended)
+
+Requirements:
+
+- Git
+- Docker Desktop with Docker Compose enabled
+
+Clone and start the complete stack:
+
+```powershell
+git clone https://github.com/GAWI01/FPL-AI.git
+cd FPL-AI
+docker compose up --build
+```
+
+Open `http://localhost:3000`. The API health endpoint should return
+`{"status":"ok"}` at `http://localhost:8000/health`.
+
+Stop the stack with `Ctrl+C`, then run `docker compose down` if you also want to
+remove the containers and network. Local source files and model artifacts are
+not deleted.
+
+### Option B: Run the development servers directly
+
+Requirements:
+
+- Python 3.12 or newer
+- Node.js 22 or newer
+- pnpm via Corepack
+- Git
+
+Clone the repository and prepare the backend from PowerShell:
+
+```powershell
+git clone https://github.com/GAWI01/FPL-AI.git
+cd FPL-AI
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt -r backend/requirements.txt
+python -m uvicorn backend.main:app --reload --port 8000
+```
+
+Leave that terminal running. In a second PowerShell terminal:
+
+```powershell
+cd FPL-AI\frontend
+corepack enable
+pnpm install --frozen-lockfile
+Copy-Item ..\.env.example .env.local
+pnpm dev
+```
+
+Then open `http://localhost:3000`. Useful local checks are:
+
+```powershell
+Invoke-RestMethod http://localhost:8000/health
+Invoke-RestMethod http://localhost:8000/api/v1/status
+```
+
+On macOS/Linux, activate the virtual environment with
+`source .venv/bin/activate` and copy the frontend environment file with
+`cp ../.env.example .env.local`.
+
+### Local configuration
+
+Only variable names are documented here; never commit real secrets in `.env`
+files.
+
+| Variable | Purpose | Local default |
+| --- | --- | --- |
+| `NEXT_PUBLIC_API_URL` | Browser-visible backend origin, compiled into the frontend | `http://127.0.0.1:8000` |
+| `FPL_AI_CORS_ORIGINS` | Comma-separated frontend origins accepted by FastAPI | `http://localhost:3000,http://127.0.0.1:3000` |
+
+The included `.env.example` contains safe local values. The frontend copy must
+be named `frontend/.env.local`; it is ignored by Git.
+
+### Troubleshooting
+
+- **The page opens but data does not load:** verify `/health` and
+  `/api/v1/status`, then confirm `frontend/.env.local` points to port `8000`.
+- **CORS error in the browser:** include the exact frontend origin in
+  `FPL_AI_CORS_ORIGINS` and restart the backend.
+- **Team not found:** use the numeric public Team ID, not a team name or league
+  ID. A team may be unavailable before its first official Gameweek deadline.
+- **Stale dependencies:** rerun `pnpm install --frozen-lockfile` and the two
+  Python `pip install` commands above.
+
+For production-like local startup and hosted deployment checks, see
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## Vision
 
@@ -32,7 +138,8 @@ The project has successfully built:
 - rotation-risk features
 - initial squad/Wildcard optimizer experiments
 
-Recent successful pipeline outputs have contained 616 players.
+The current certified GW3 model artifact contains 623 players; the live official
+2026/27 bootstrap smoke on 2026-09-01 returned 629 players.
 
 ## V1–V5: what we learned
 
@@ -199,4 +306,3 @@ Include:
 Do not start by writing another giant optimizer script.
 
 First inspect the current codebase, identify reusable components, define clean data contracts, then implement the new optimizer as a separate, testable module.
-

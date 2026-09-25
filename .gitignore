@@ -37,6 +37,18 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+.tmp/
+tmp/
+output/
+.superpowers/
+
+# Local backup copies
+app_backup*.py
+frontend/app/page_backup.tsx
+
+# Frontend output
+frontend/.next/
+frontend/node_modules/
 
 # Jupyter
 .ipynb_checkpoints/

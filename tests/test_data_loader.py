@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-import data_loader
+from backend import data_loader
 
 
 def _write_csv(base: Path, filename: str, data: dict) -> None:
